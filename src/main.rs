@@ -1,14 +1,17 @@
-use log::{error, info};
-use std::{env, fs, process};
-use std::error::Error;
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 use clap::Parser;
-use std::process::Command;
+use log::{error, info};
+use std::{
+    env,
+    fs::{self, File},
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    process::{self, Command},
+};
+use walkdir::WalkDir;
 
 /// 嵌入 `rename.exe` 的二进制数据
-const RENAME_EXE_DATA: &[u8] = include_bytes!("rename.exe");
+// 嵌入 `rename.exe` 的字节数据  , 该二进制似乎不能通过build.rs来完成复制,而是使用`cp`命令
+const RENAME_EXE_DATA: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/rename.exe"));
 
 /// 程序的命令行参数
 #[derive(Parser, Debug)]
@@ -30,11 +33,15 @@ struct Args {
 fn main() {
     std::env::set_var("RUST_LOG", "debug");
     env_logger::init();
+
+    // 解析命令行参数
     let args = Args::parse();
 
-    // 释放 rename.exe 到临时目录
-    let temp_dir = std::env::temp_dir();
+    // 获取临时目录并生成 rename.exe 文件路径
+    let temp_dir = env::temp_dir();
     let rename_exe_path = temp_dir.join("rename.exe");
+
+    // 将 `rename.exe` 写入临时目录
     if let Err(err) = write_temp_rename_exe(&rename_exe_path) {
         error!("释放 rename.exe 失败: {}", err);
         return;
@@ -54,7 +61,9 @@ fn main() {
         }
 
         // 删除临时释放的 rename.exe
-        let _ = fs::remove_file(&rename_exe_path);
+        if let Err(err) = fs::remove_file(&rename_exe_path) {
+            error!("删除临时文件失败: {}", err);
+        }
         return;
     }
 
@@ -62,7 +71,9 @@ fn main() {
     let exe_path = std::env::current_exe().expect("无法获取可执行文件路径");
     let self_name = exe_path.file_name().unwrap().to_str().unwrap();
     let current_dir = std::env::current_dir().expect("无法获取当前工作目录");
-    let all_files = get_all_files_include_sub_folder(&current_dir);
+
+    // 获取所有文件路径，包括子文件夹
+    let all_files = get_all_files_in_subfolders(&current_dir);
 
     for path in all_files {
         // 跳过当前执行程序
@@ -71,44 +82,49 @@ fn main() {
         }
 
         let dst_file_path = format!("{}.temp", path);
+
+        // 复制文件
         if let Err(err) = copy_file(&path, &dst_file_path) {
             error!("复制文件 {} 到 {} 失败: {}", path, dst_file_path, err);
             continue;
         }
 
-        info!("正在删除原文件");
+        info!("正在删除原文件 {}", path);
+        // 删除源文件
         if let Err(err) = fs::remove_file(&path) {
             error!("删除文件 {} 失败: {}", path, err);
             continue;
         }
-        info!("删除完成");
 
-        // 重命名为原名称
+        // 执行重命名操作
         let new_file_path = path.clone();
         if let Err(err) = run_rename_exe(&rename_exe_path, &dst_file_path, &new_file_path) {
             error!("重命名文件 {} 到 {} 失败: {}", dst_file_path, new_file_path, err);
             continue;
         }
+
         info!("文件成功重命名: {} -> {}", dst_file_path, new_file_path);
     }
 
     // 删除临时释放的 rename.exe
-    let _ = fs::remove_file(&rename_exe_path);
+    if let Err(err) = fs::remove_file(&rename_exe_path) {
+        error!("删除临时文件失败: {}", err);
+    }
 
     info!("操作完成，按回车键退出");
     let mut input = String::new();
     io::stdin().read_line(&mut input).expect("读取输入失败");
 }
 
-/// 释放 `rename.exe` 到指定路径
-fn write_temp_rename_exe(rename_exe_path: &Path) -> Result<(), Box<dyn Error>> {
-    let mut file = fs::File::create(rename_exe_path)?;
+/// 释放 `rename.exe` 到临时目录
+fn write_temp_rename_exe(rename_exe_path: &Path) -> io::Result<()> {
+    let mut file = File::create(rename_exe_path)?;
     file.write_all(RENAME_EXE_DATA)?;
     Ok(())
 }
 
 /// 调用 `rename.exe` 进行重命名
-fn run_rename_exe(rename_exe_path: &Path, source_path: &str, dest_path: &str) -> Result<(), Box<dyn Error>> {
+fn run_rename_exe(rename_exe_path: &Path, source_path: &str, dest_path: &str) -> io::Result<()> {
     let output = Command::new(rename_exe_path)
         .arg("-s")
         .arg(source_path)
@@ -118,7 +134,7 @@ fn run_rename_exe(rename_exe_path: &Path, source_path: &str, dest_path: &str) ->
 
     if !output.status.success() {
         error!("rename.exe 执行失败: {:?}", String::from_utf8_lossy(&output.stderr));
-        return Err("重命名失败".into());
+        return Err(io::Error::new(io::ErrorKind::Other, "重命名失败"));
     }
 
     if !output.stdout.is_empty() {
@@ -129,10 +145,11 @@ fn run_rename_exe(rename_exe_path: &Path, source_path: &str, dest_path: &str) ->
 }
 
 /// 复制文件
-fn copy_file(source_path: &str, dst_file_path: &str) -> Result<(), Box<dyn Error>> {
-    let mut source = fs::File::open(source_path)?;
-    let mut destination = fs::File::create(dst_file_path)?;
+fn copy_file(source_path: &str, dst_file_path: &str) -> io::Result<()> {
+    let mut source = File::open(source_path)?;
+    let mut destination = File::create(dst_file_path)?;
     let mut buffer = [0; 1024];
+
     loop {
         let bytes_read = source.read(&mut buffer)?;
         if bytes_read == 0 {
@@ -140,11 +157,12 @@ fn copy_file(source_path: &str, dst_file_path: &str) -> Result<(), Box<dyn Error
         }
         destination.write_all(&buffer[..bytes_read])?;
     }
+
     Ok(())
 }
 
 /// 获取目录下所有文件（包含子目录）
-fn get_all_files_include_sub_folder(folder: &PathBuf) -> Vec<String> {
+fn get_all_files_in_subfolders(folder: &Path) -> Vec<String> {
     let mut result = Vec::new();
     for entry in WalkDir::new(folder) {
         let entry = entry.expect("无法读取目录条目");
